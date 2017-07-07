@@ -10,6 +10,7 @@ using System.Configuration;
 using ImageUploadAPI.Controllers;
 using Swashbuckle.Swagger.Annotations;
 using Microsoft.WindowsAzure.Storage.Blob;
+using ExifLib;
 
 namespace ImageUpload.Controllers
 {
@@ -75,7 +76,54 @@ namespace ImageUpload.Controllers
             {
                 using (var fileStream = await uploadedFile.ReadAsStreamAsync()) //as Stream is IDisposable
                 {
-                    blockBlob.UploadFromStream(fileStream);
+                    using (MemoryStream memo = new MemoryStream())
+                    {
+                        // add meta data to the file for CaptureDate/ Time and GPS
+
+                        fileStream.Position = 0;
+                        fileStream.CopyTo(memo);
+                        memo.Position = 0;
+
+                        try
+                        {
+                            using (ExifReader reader = new ExifReader(memo))
+                            {
+
+                                // Extract the tag data using the ExifTags enumeration
+                                DateTime datePictureTaken;
+                                Double latGPS, longGPS;
+
+                                // EXIF lat/long tags stored as [Degree, Minute, Second]
+                                double[] latitudeComponents;
+                                double[] longitudeComponents;
+
+                                string latitudeRef; // "N" or "S" ("S" will be negative latitude)
+                                string longitudeRef; // "E" or "W" ("W" will be a negative longitude)
+
+                                if (reader.GetTagValue<DateTime>(ExifTags.DateTimeDigitized,
+                                                                out datePictureTaken))
+                                {
+                                    blockBlob.Metadata["exifCaptureDate"] = datePictureTaken.ToString("MMddyyyy");
+                                    blockBlob.Metadata["exifCaptureTime"] = datePictureTaken.ToString("HHmmss");
+                                }
+
+                                if (reader.GetTagValue(ExifTags.GPSLatitude, out latitudeComponents)
+                                    && reader.GetTagValue(ExifTags.GPSLongitude, out longitudeComponents)
+                                    && reader.GetTagValue(ExifTags.GPSLatitudeRef, out latitudeRef)
+                                    && reader.GetTagValue(ExifTags.GPSLongitudeRef, out longitudeRef))
+                                {
+                                    blockBlob.Metadata["exifLatGPS"] = ConvertDegreeAngleToDouble(latitudeComponents[0], latitudeComponents[1], latitudeComponents[2], latitudeRef).ToString();
+                                    blockBlob.Metadata["exifLongGPS"] = ConvertDegreeAngleToDouble(longitudeComponents[0], longitudeComponents[1], longitudeComponents[2], longitudeRef).ToString();
+                                }
+                            }
+                        }
+                        catch { }
+
+
+                        fileStream.Position = 0;
+                        blockBlob.UploadFromStream(fileStream);
+
+                    }
                 }
             }
             catch (StorageException e)
@@ -103,6 +151,23 @@ namespace ImageUpload.Controllers
             }
 
         }
+
+        private static double ConvertDegreeAngleToDouble(double degrees, double minutes, double seconds, string latLongRef)
+        {
+            double result = ConvertDegreeAngleToDouble(degrees, minutes, seconds);
+            if (latLongRef == "S" || latLongRef == "W")
+            {
+                // handle southern hemisphere locations
+                result *= -1;
+            }
+            return result;
+        }
+
+        private static double ConvertDegreeAngleToDouble(double degrees, double minutes, double seconds)
+        {
+            return degrees + (minutes / 60) + (seconds / 3600);
+        }
+
         /// <summary>
         /// Extract the file extension for the file passed
         /// </summary>
