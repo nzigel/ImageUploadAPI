@@ -9,8 +9,9 @@ using Microsoft.WindowsAzure.Storage;
 using System.Configuration;
 using ImageUploadAPI.Controllers;
 using Swashbuckle.Swagger.Annotations;
-using Microsoft.WindowsAzure.Storage.Blob;
-using ExifLib;
+using Microsoft.Azure.Documents.Client;
+using Newtonsoft.Json;
+using Microsoft.WindowsAzure.Storage.Queue;
 
 namespace ImageUpload.Controllers
 {
@@ -35,11 +36,9 @@ namespace ImageUpload.Controllers
         [SwaggerOperation("UploadImage")]
         public async Task<IHttpActionResult> UploadImage(string fileName = "")
         {
-            //Use a GUID in case the fileName is not specified
-            if (fileName == "")
-            {
-                fileName = Guid.NewGuid().ToString();
-            }
+            var recordId = Guid.NewGuid();
+            fileName = recordId.ToString();
+
             //Check if submitted content is of MIME Multi Part Content with Form-data in it?
             if (!Request.Content.IsMimeMultipartContent("form-data"))
             {
@@ -61,12 +60,20 @@ namespace ImageUpload.Controllers
             //create the full name of the image with the fileName and extension
             var imageName = string.Concat(fileName, extension);
 
+            string documentDbName = ConfigurationManager.AppSettings["documentDbName"];
+            string documentDbCol = ConfigurationManager.AppSettings["documentDbCol"];
+            string documentDbEndpoint = ConfigurationManager.AppSettings["documentDbEndpoint"];
+            string documentDbKey = ConfigurationManager.AppSettings["documentDbKey"];
+
+            string containerName = ConfigurationManager.AppSettings["containerName"];
+            string queueName = ConfigurationManager.AppSettings["queueName"];
+
             //Get the reference to the Blob Storage and upload the file there
             var storageConnectionString = ConfigurationManager.AppSettings["StorageConnectionString"];
             var storageAccount = CloudStorageAccount.Parse(storageConnectionString);
             var blobClient = storageAccount.CreateCloudBlobClient();
 
-            var container = blobClient.GetContainerReference("images");
+            var container = blobClient.GetContainerReference(containerName);
             container.CreateIfNotExists();
 
             var blockBlob = container.GetBlockBlobReference(imageName);
@@ -76,60 +83,54 @@ namespace ImageUpload.Controllers
             {
                 using (var fileStream = await uploadedFile.ReadAsStreamAsync()) //as Stream is IDisposable
                 {
-                    using (MemoryStream memo = new MemoryStream())
-                    {
-                        // add meta data to the file for CaptureDate/ Time and GPS
-
-                        fileStream.Position = 0;
-                        fileStream.CopyTo(memo);
-                        memo.Position = 0;
-
-                        try
-                        {
-                            using (ExifReader reader = new ExifReader(memo))
-                            {
-
-                                // Extract the tag data using the ExifTags enumeration
-                                DateTime datePictureTaken;
-                                Double latGPS, longGPS;
-
-                                // EXIF lat/long tags stored as [Degree, Minute, Second]
-                                double[] latitudeComponents;
-                                double[] longitudeComponents;
-
-                                string latitudeRef; // "N" or "S" ("S" will be negative latitude)
-                                string longitudeRef; // "E" or "W" ("W" will be a negative longitude)
-
-                                if (reader.GetTagValue<DateTime>(ExifTags.DateTimeDigitized,
-                                                                out datePictureTaken))
-                                {
-                                    blockBlob.Metadata["exifCaptureDate"] = datePictureTaken.ToString("MMddyyyy");
-                                    blockBlob.Metadata["exifCaptureTime"] = datePictureTaken.ToString("HHmmss");
-                                }
-
-                                if (reader.GetTagValue(ExifTags.GPSLatitude, out latitudeComponents)
-                                    && reader.GetTagValue(ExifTags.GPSLongitude, out longitudeComponents)
-                                    && reader.GetTagValue(ExifTags.GPSLatitudeRef, out latitudeRef)
-                                    && reader.GetTagValue(ExifTags.GPSLongitudeRef, out longitudeRef))
-                                {
-                                    blockBlob.Metadata["exifLatGPS"] = ConvertDegreeAngleToDouble(latitudeComponents[0], latitudeComponents[1], latitudeComponents[2], latitudeRef).ToString();
-                                    blockBlob.Metadata["exifLongGPS"] = ConvertDegreeAngleToDouble(longitudeComponents[0], longitudeComponents[1], longitudeComponents[2], longitudeRef).ToString();
-                                }
-                            }
-                        }
-                        catch { }
-
-
-                        fileStream.Position = 0;
-                        blockBlob.UploadFromStream(fileStream);
-
-                    }
+                    // save the blob to the container
+                    await blockBlob.UploadFromStreamAsync(fileStream);
                 }
             }
             catch (StorageException e)
             {
                 return BadRequest(e.Message);
             }
+
+            try
+            {
+                DocumentClient client = new DocumentClient(new Uri(documentDbEndpoint), documentDbKey);
+                // save document for storing metadata from function
+                await client.CreateDocumentAsync(
+                    UriFactory.CreateDocumentCollectionUri(documentDbName, documentDbCol),
+                    new ImageMetadata
+                    {
+                        Id = recordId,
+                        MediaUrl = blockBlob.Uri.ToString(),
+                        OcrTxt = null,
+                        HasHighVoltageSign = null,
+                        HasLiveElectricalSign = null,
+                        HasLiveWiresSign = null,
+                        Tags = null,
+                        DominantColours = null,
+                        AccentColour = null,
+                        IsOnFire = null,
+                        ContainsTransformer = null,
+                        ContainsPole = null,
+                        ExifCaptureDate = null,
+                        ExifCaptureTime = null,
+                        ExifLatGPS = null,
+                        ExifLongGPS = null,
+                        Created = DateTime.UtcNow
+                    });
+            }
+            catch { }
+
+            try
+            {
+                // notify through queue for the function to pick up
+                var queueClient = storageAccount.CreateCloudQueueClient();
+                var queue = queueClient.GetQueueReference(queueName);
+                var payload = new { BlobName = recordId.ToString(), DocumentId = recordId.ToString() };
+                
+                queue.AddMessage(new CloudQueueMessage(JsonConvert.SerializeObject(payload)));
+            }
+            catch { }
 
             try
             {
@@ -152,20 +153,29 @@ namespace ImageUpload.Controllers
 
         }
 
-        private static double ConvertDegreeAngleToDouble(double degrees, double minutes, double seconds, string latLongRef)
+        private class ImageMetadata
         {
-            double result = ConvertDegreeAngleToDouble(degrees, minutes, seconds);
-            if (latLongRef == "S" || latLongRef == "W")
-            {
-                // handle southern hemisphere locations
-                result *= -1;
-            }
-            return result;
-        }
+            [JsonProperty(PropertyName = "id")]
+            public Guid Id { get; set; }
 
-        private static double ConvertDegreeAngleToDouble(double degrees, double minutes, double seconds)
-        {
-            return degrees + (minutes / 60) + (seconds / 3600);
+            public string MediaUrl { get; set; }
+
+            public string OcrTxt { get; set; }
+            public bool? HasHighVoltageSign { get; set; }
+            public bool? HasLiveElectricalSign { get; set; }
+            public bool? HasLiveWiresSign { get; set; }
+            public string Tags { get; set; }
+            public string DominantColours { get; set; }
+            public string AccentColour { get; set; }
+            public bool? IsOnFire { get; set; }
+            public bool? ContainsTransformer { get; set; }
+            public bool? ContainsPole { get; set; }
+            public string ExifCaptureDate { get; set; }
+            public string ExifCaptureTime { get; set; }
+            public string ExifLatGPS { get; set; }
+            public string ExifLongGPS { get; set; }
+
+            public DateTime Created { get; set; }
         }
 
         /// <summary>

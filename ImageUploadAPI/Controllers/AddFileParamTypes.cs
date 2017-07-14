@@ -10,6 +10,7 @@ namespace ImageUploadAPI.Controllers
         {
             if (operation.operationId == "UploadImage")  // SwaggerOperation
             {
+
                 operation.consumes.Add("multipart/form-data");
                 operation.parameters = new List<Parameter>
                 {
