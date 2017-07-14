@@ -17,3 +17,5 @@ Create a PrivateSettings.config file and store your keys as follows:
 <add key="queueName" value="inputqueue" />      
 </appSettings>
 ```
+
+Read more at https://powerapps.microsoft.com/en-us/blog/custom-api-for-image-upload/
